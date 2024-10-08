@@ -262,6 +262,7 @@ default = [
   "trash-support",
   "sqlite",
   "mimalloc",
+  "system-clipboard"
 ]
 stable = ["default"]
 # NOTE: individual features are also passed to `nu-cmd-lang` that uses them to generate the feature matrix in the `version` command
