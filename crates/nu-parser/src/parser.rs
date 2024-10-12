@@ -240,10 +240,26 @@ fn parse_unknown_arg(
 /// string, where each balanced pair of quotes is parsed as a separate part of the string, and then
 /// concatenated together.
 ///
+/// `keep_surround_backtick_quote` should be true when parsing it as command name.  Or else it
+/// should be false.
+///
 /// For example, `-foo="bar\nbaz"` becomes `$"-foo=bar\nbaz"`
-fn parse_external_string(working_set: &mut StateWorkingSet, span: Span) -> Expression {
-    let contents = &working_set.get_span_contents(span);
+fn parse_external_string(
+    working_set: &mut StateWorkingSet,
+    mut span: Span,
+    keep_surround_bakctick_quote: bool,
+) -> Expression {
+    let mut contents = working_set.get_span_contents(span);
 
+    if !keep_surround_bakctick_quote
+        && contents.len() > 1
+        && contents.starts_with(b"`")
+        && contents.ends_with(b"`")
+    {
+        contents = &contents[1..contents.len() - 1];
+        // backtick quote is useless in this case, so span is required to updated.
+        span = Span::new(span.start + 1, span.end - 1);
+    }
     if contents.starts_with(b"r#") {
         parse_raw_string(working_set, span)
     } else if contents
@@ -441,7 +457,7 @@ fn parse_regular_external_arg(working_set: &mut StateWorkingSet, span: Span) -> 
     } else if contents.starts_with(b"[") {
         parse_list_expression(working_set, span, &SyntaxShape::Any)
     } else {
-        parse_external_string(working_set, span)
+        parse_external_string(working_set, span, false)
     }
 }
 
@@ -463,7 +479,7 @@ pub fn parse_external_call(working_set: &mut StateWorkingSet, spans: &[Span]) ->
         let arg = parse_expression(working_set, &[head_span]);
         Box::new(arg)
     } else {
-        Box::new(parse_external_string(working_set, head_span))
+        Box::new(parse_external_string(working_set, head_span, true))
     };
 
     let args = spans[1..]
@@ -2927,6 +2943,10 @@ pub fn parse_string_strict(working_set: &mut StateWorkingSet, span: Span) -> Exp
             working_set.error(ParseError::Unclosed("\'".into(), span));
             return garbage(working_set, span);
         }
+        if bytes.starts_with(b"r#") && (bytes.len() == 1 || !bytes.ends_with(b"#")) {
+            working_set.error(ParseError::Unclosed("r#".into(), span));
+            return garbage(working_set, span);
+        }
     }
 
     let (bytes, quoted) = if (bytes.starts_with(b"\"") && bytes.ends_with(b"\"") && bytes.len() > 1)
@@ -5380,10 +5400,12 @@ pub fn parse_expression(working_set: &mut StateWorkingSet, spans: &[Span]) -> Ex
 
             let starting_error_count = working_set.parse_errors.len();
 
-            let lhs = parse_string_strict(
-                working_set,
-                Span::new(spans[pos].start, spans[pos].start + point - 1),
-            );
+            let lhs_span = Span::new(spans[pos].start, spans[pos].start + point - 1);
+            if !is_identifier(working_set.get_span_contents(lhs_span)) {
+                break;
+            }
+
+            let lhs = parse_string_strict(working_set, lhs_span);
             let rhs = if spans[pos].start + point < spans[pos].end {
                 let rhs_span = Span::new(spans[pos].start + point, spans[pos].end);
 
