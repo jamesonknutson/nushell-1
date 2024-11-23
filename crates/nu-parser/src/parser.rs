@@ -240,34 +240,21 @@ fn parse_unknown_arg(
 /// string, where each balanced pair of quotes is parsed as a separate part of the string, and then
 /// concatenated together.
 ///
-/// `keep_surround_backtick_quote` should be true when parsing it as command name.  Or else it
-/// should be false.
-///
 /// For example, `-foo="bar\nbaz"` becomes `$"-foo=bar\nbaz"`
-fn parse_external_string(
-    working_set: &mut StateWorkingSet,
-    mut span: Span,
-    keep_surround_bakctick_quote: bool,
-) -> Expression {
-    let mut contents = working_set.get_span_contents(span);
+fn parse_external_string(working_set: &mut StateWorkingSet, span: Span) -> Expression {
+    let contents = working_set.get_span_contents(span);
 
-    if !keep_surround_bakctick_quote
-        && contents.len() > 1
-        && contents.starts_with(b"`")
-        && contents.ends_with(b"`")
-    {
-        contents = &contents[1..contents.len() - 1];
-        // backtick quote is useless in this case, so span is required to updated.
-        span = Span::new(span.start + 1, span.end - 1);
-    }
     if contents.starts_with(b"r#") {
         parse_raw_string(working_set, span)
     } else if contents
         .iter()
-        .any(|b| matches!(b, b'"' | b'\'' | b'(' | b')'))
+        .any(|b| matches!(b, b'"' | b'\'' | b'(' | b')' | b'`'))
     {
         enum State {
             Bare {
+                from: usize,
+            },
+            BackTickQuote {
                 from: usize,
             },
             Quote {
@@ -320,6 +307,12 @@ fn parse_external_string(
                             continue;
                         }
                     }
+                    b'`' => {
+                        if index != *from {
+                            spans.push(make_span(*from, index))
+                        }
+                        state = State::BackTickQuote { from: index }
+                    }
                     // Continue to consume
                     _ => (),
                 },
@@ -342,13 +335,21 @@ fn parse_external_string(
                         *escaped = false;
                     }
                 },
+                State::BackTickQuote { from } => {
+                    if ch == b'`' {
+                        spans.push(make_span(*from, index + 1));
+                        state = State::Bare { from: index + 1 };
+                    }
+                }
             }
             index += 1;
         }
 
         // Add the final span
         match state {
-            State::Bare { from } | State::Quote { from, .. } => {
+            State::Bare { from }
+            | State::Quote { from, .. }
+            | State::BackTickQuote { from, .. } => {
                 if from < contents.len() {
                     spans.push(make_span(from, contents.len()));
                 }
@@ -457,7 +458,7 @@ fn parse_regular_external_arg(working_set: &mut StateWorkingSet, span: Span) -> 
     } else if contents.starts_with(b"[") {
         parse_list_expression(working_set, span, &SyntaxShape::Any)
     } else {
-        parse_external_string(working_set, span, false)
+        parse_external_string(working_set, span)
     }
 }
 
@@ -479,7 +480,7 @@ pub fn parse_external_call(working_set: &mut StateWorkingSet, spans: &[Span]) ->
         let arg = parse_expression(working_set, &[head_span]);
         Box::new(arg)
     } else {
-        Box::new(parse_external_string(working_set, head_span, true))
+        Box::new(parse_external_string(working_set, head_span))
     };
 
     let args = spans[1..]
@@ -1342,10 +1343,10 @@ pub fn parse_call(working_set: &mut StateWorkingSet, spans: &[Span], head: Span)
                 trace!("parsing: alias of external call");
 
                 let mut head = head.clone();
-                head.span = spans[0]; // replacing the spans preserves syntax highlighting
+                head.span = Span::concat(&spans[cmd_start..pos]); // replacing the spans preserves syntax highlighting
 
                 let mut final_args = args.clone().into_vec();
-                for arg_span in &spans[1..] {
+                for arg_span in &spans[pos..] {
                     let arg = parse_external_arg(working_set, *arg_span);
                     final_args.push(arg);
                 }
@@ -2311,7 +2312,7 @@ pub fn parse_full_cell_path(
         } else if bytes.starts_with(b"[") {
             trace!("parsing: table head of full cell path");
 
-            let output = parse_table_expression(working_set, head.span);
+            let output = parse_table_expression(working_set, head.span, &SyntaxShape::Any);
 
             tokens.next();
 
@@ -4119,7 +4120,11 @@ fn parse_table_row(
         .map(|exprs| (exprs, span))
 }
 
-fn parse_table_expression(working_set: &mut StateWorkingSet, span: Span) -> Expression {
+fn parse_table_expression(
+    working_set: &mut StateWorkingSet,
+    span: Span,
+    list_element_shape: &SyntaxShape,
+) -> Expression {
     let bytes = working_set.get_span_contents(span);
     let inner_span = {
         let start = if bytes.starts_with(b"[") {
@@ -4148,13 +4153,13 @@ fn parse_table_expression(working_set: &mut StateWorkingSet, span: Span) -> Expr
     // Check that we have all arguments first, before trying to parse the first
     // in order to avoid exponential parsing time
     let [first, second, rest @ ..] = &tokens[..] else {
-        return parse_list_expression(working_set, span, &SyntaxShape::Any);
+        return parse_list_expression(working_set, span, list_element_shape);
     };
     if !working_set.get_span_contents(first.span).starts_with(b"[")
         || second.contents != TokenContents::Semicolon
         || rest.is_empty()
     {
-        return parse_list_expression(working_set, span, &SyntaxShape::Any);
+        return parse_list_expression(working_set, span, list_element_shape);
     };
     let head = parse_table_row(working_set, first.span);
 
@@ -4770,7 +4775,7 @@ pub fn parse_value(
         }
         SyntaxShape::List(elem) => {
             if bytes.starts_with(b"[") {
-                parse_list_expression(working_set, span, elem)
+                parse_table_expression(working_set, span, elem)
             } else {
                 working_set.error(ParseError::Expected("list", span));
 
@@ -4779,7 +4784,7 @@ pub fn parse_value(
         }
         SyntaxShape::Table(_) => {
             if bytes.starts_with(b"[") {
-                parse_table_expression(working_set, span)
+                parse_table_expression(working_set, span, &SyntaxShape::Any)
             } else {
                 working_set.error(ParseError::Expected("table", span));
 
