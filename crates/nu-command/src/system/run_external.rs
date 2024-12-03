@@ -1,10 +1,12 @@
 use nu_cmd_base::hook::eval_hook;
-use nu_engine::{command_prelude::*, env_to_strings, get_eval_expression};
-use nu_path::{dots::expand_ndots, expand_tilde};
+use nu_engine::{command_prelude::*, env_to_strings};
+use nu_path::{dots::expand_ndots, expand_tilde, AbsolutePath};
 use nu_protocol::{did_you_mean, process::ChildProcess, ByteStream, NuGlob, OutDest, Signals};
 use nu_system::ForegroundChild;
 use nu_utils::IgnoreCaseExt;
 use pathdiff::diff_paths;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     borrow::Cow,
     ffi::{OsStr, OsString},
@@ -51,7 +53,6 @@ impl Command for External {
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let cwd = engine_state.cwd(Some(stack))?;
-
         let name: Value = call.req(engine_state, stack, 0)?;
 
         let name_str: Cow<str> = match &name {
@@ -68,17 +69,70 @@ impl Command for External {
             _ => Path::new(&*name_str).to_owned(),
         };
 
+        // On Windows, the user could have run the cmd.exe built-in "assoc" command
+        // Example: "assoc .nu=nuscript" and then run the cmd.exe built-in "ftype" command
+        // Example: "ftype nuscript=C:\path\to\nu.exe '%1' %*" and then added the nushell
+        // script extension ".NU" to the PATHEXT environment variable. In this case, we use
+        // the which command, which will find the executable with or without the extension.
+        // If it "which" returns true, that means that we've found the nushell script and we
+        // believe the user wants to use the windows association to run the script. The only
+        // easy way to do this is to run cmd.exe with the script as an argument.
+        let potential_nuscript_in_windows = if cfg!(windows) {
+            // let's make sure it's a .nu script
+            if let Some(executable) = which(&expanded_name, "", cwd.as_ref()) {
+                let ext = executable
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_uppercase();
+                ext == "NU"
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // let's make sure it's a .ps1 script, but only on Windows
+        let potential_powershell_script = if cfg!(windows) {
+            if let Some(executable) = which(&expanded_name, "", cwd.as_ref()) {
+                let ext = executable
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_uppercase();
+                ext == "PS1"
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Find the absolute path to the executable. On Windows, set the
         // executable to "cmd.exe" if it's a CMD internal command. If the
         // command is not found, display a helpful error message.
-        let executable = if cfg!(windows) && is_cmd_internal_command(&name_str) {
+        let executable = if cfg!(windows)
+            && (is_cmd_internal_command(&name_str) || potential_nuscript_in_windows)
+        {
             PathBuf::from("cmd.exe")
+        } else if cfg!(windows) && potential_powershell_script {
+            // If we're on Windows and we're trying to run a PowerShell script, we'll use
+            // `powershell.exe` to run it. We shouldn't have to check for powershell.exe because
+            // it's automatically installed on all modern windows systems.
+            PathBuf::from("powershell.exe")
         } else {
             // Determine the PATH to be used and then use `which` to find it - though this has no
             // effect if it's an absolute path already
             let paths = nu_engine::env::path_str(engine_state, stack, call.head)?;
-            let Some(executable) = which(expanded_name, &paths, cwd.as_ref()) else {
-                return Err(command_not_found(&name_str, call.head, engine_state, stack));
+            let Some(executable) = which(&expanded_name, &paths, cwd.as_ref()) else {
+                return Err(command_not_found(
+                    &name_str,
+                    call.head,
+                    engine_state,
+                    stack,
+                    &cwd,
+                ));
             };
             executable
         };
@@ -97,15 +151,29 @@ impl Command for External {
         // Configure args.
         let args = eval_arguments_from_call(engine_state, stack, call)?;
         #[cfg(windows)]
-        if is_cmd_internal_command(&name_str) {
-            use std::os::windows::process::CommandExt;
-
+        if is_cmd_internal_command(&name_str) || potential_nuscript_in_windows {
             // The /D flag disables execution of AutoRun commands from registry.
             // The /C flag followed by a command name instructs CMD to execute
             // that command and quit.
-            command.args(["/D", "/C", &name_str]);
+            command.args(["/D", "/C", &expanded_name.to_string_lossy()]);
             for arg in &args {
                 command.raw_arg(escape_cmd_argument(arg)?);
+            }
+        } else if potential_powershell_script {
+            use nu_path::canonicalize_with;
+
+            // canonicalize the path to the script so that tests pass
+            let canon_path = if let Ok(cwd) = engine_state.cwd_as_string(None) {
+                canonicalize_with(&expanded_name, cwd)?
+            } else {
+                // If we can't get the current working directory, just provide the expanded name
+                expanded_name
+            };
+            // The -Command flag followed by a script name instructs PowerShell to
+            // execute that script and quit.
+            command.args(["-Command", &canon_path.to_string_lossy()]);
+            for arg in &args {
+                command.raw_arg(arg.item.clone());
             }
         } else {
             command.args(args.into_iter().map(|s| s.item));
@@ -227,8 +295,7 @@ pub fn eval_arguments_from_call(
     call: &Call,
 ) -> Result<Vec<Spanned<OsString>>, ShellError> {
     let cwd = engine_state.cwd(Some(stack))?;
-    let eval_expression = get_eval_expression(engine_state);
-    let call_args = call.rest_iter_flattened(engine_state, stack, eval_expression, 1)?;
+    let call_args = call.rest::<Value>(engine_state, stack, 1)?;
     let mut args: Vec<Spanned<OsString>> = Vec::with_capacity(call_args.len());
 
     for arg in call_args {
@@ -371,6 +438,7 @@ pub fn command_not_found(
     span: Span,
     engine_state: &EngineState,
     stack: &mut Stack,
+    cwd: &AbsolutePath,
 ) -> ShellError {
     // Run the `command_not_found` hook if there is one.
     if let Some(hook) = &stack.get_config(engine_state).hooks.command_not_found {
@@ -481,12 +549,12 @@ pub fn command_not_found(
     }
 
     // If we find a file, it's likely that the user forgot to set permissions
-    if Path::new(name).is_file() {
+    if cwd.join(name).is_file() {
         return ShellError::ExternalCommand {
-                        label: format!("Command `{name}` not found"),
-                        help: format!("`{name}` refers to a file that is not executable. Did you forget to to set execute permissions?"),
-                        span,
-                    };
+            label: format!("Command `{name}` not found"),
+            help: format!("`{name}` refers to a file that is not executable. Did you forget to set execute permissions?"),
+            span,
+        };
     }
 
     // We found nothing useful. Give up and return a generic error message.

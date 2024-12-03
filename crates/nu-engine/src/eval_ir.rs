@@ -1,18 +1,20 @@
 use std::{borrow::Cow, fs::File, sync::Arc};
 
-use nu_path::{expand_path_with, AbsolutePathBuf};
+use nu_path::AbsolutePathBuf;
 use nu_protocol::{
     ast::{Bits, Block, Boolean, CellPath, Comparison, Math, Operator},
     debugger::DebugContext,
-    engine::{Argument, Closure, EngineState, ErrorHandler, Matcher, Redirection, Stack},
+    engine::{
+        Argument, Closure, EngineState, ErrorHandler, Matcher, Redirection, Stack, StateWorkingSet,
+    },
     ir::{Call, DataSlice, Instruction, IrAstRef, IrBlock, Literal, RedirectMode},
-    ByteStreamSource, DataSource, DeclId, ErrSpan, Flag, IntoPipelineData, IntoSpanned, ListStream,
-    OutDest, PipelineData, PipelineMetadata, PositionalArg, Range, Record, RegId, ShellError,
-    Signals, Signature, Span, Spanned, Type, Value, VarId, ENV_VARIABLE_ID,
+    DataSource, DeclId, ErrSpan, Flag, IntoPipelineData, IntoSpanned, ListStream, OutDest,
+    PipelineData, PipelineMetadata, PositionalArg, Range, Record, RegId, ShellError, Signals,
+    Signature, Span, Spanned, Type, Value, VarId, ENV_VARIABLE_ID,
 };
 use nu_utils::IgnoreCaseExt;
 
-use crate::{eval::is_automatic_env_var, eval_block_with_early_return};
+use crate::{eval::is_automatic_env_var, eval_block_with_early_return, redirect_env};
 
 /// Evaluate the compiled representation of a [`Block`].
 pub fn eval_ir_block<D: DebugContext>(
@@ -220,17 +222,8 @@ fn eval_ir_block_impl<D: DebugContext>(
             }
             Err(err) => {
                 if let Some(error_handler) = ctx.stack.error_handlers.pop(ctx.error_handler_base) {
-                    let fancy_errors = match ctx.engine_state.get_config().error_style {
-                        nu_protocol::ErrorStyle::Fancy => true,
-                        nu_protocol::ErrorStyle::Plain => false,
-                    };
                     // If an error handler is set, branch there
-                    prepare_error_handler(
-                        ctx,
-                        error_handler,
-                        Some(err.into_spanned(*span)),
-                        fancy_errors,
-                    );
+                    prepare_error_handler(ctx, error_handler, Some(err.into_spanned(*span)));
                     pc = error_handler.handler_index;
                 } else {
                     // If not, exit the block with the error
@@ -255,7 +248,6 @@ fn prepare_error_handler(
     ctx: &mut EvalContext<'_>,
     error_handler: ErrorHandler,
     error: Option<Spanned<ShellError>>,
-    fancy_errors: bool,
 ) {
     if let Some(reg_id) = error_handler.error_register {
         if let Some(error) = error {
@@ -266,7 +258,7 @@ fn prepare_error_handler(
                 reg_id,
                 error
                     .item
-                    .into_value(error.span, fancy_errors)
+                    .into_value(&StateWorkingSet::new(ctx.engine_state), error.span)
                     .into_pipeline_data(),
             );
         } else {
@@ -486,8 +478,9 @@ fn eval_instruction<D: DebugContext>(
             Ok(Continue)
         }
         Instruction::CheckErrRedirected { src } => match ctx.borrow_reg(*src) {
+            #[cfg(feature = "os")]
             PipelineData::ByteStream(stream, _)
-                if matches!(stream.source(), ByteStreamSource::Child(_)) =>
+                if matches!(stream.source(), nu_protocol::ByteStreamSource::Child(_)) =>
             {
                 Ok(Continue)
             }
@@ -521,7 +514,7 @@ fn eval_instruction<D: DebugContext>(
                     span: Some(*span),
                 })?;
             let is_external = if let PipelineData::ByteStream(stream, ..) = &src {
-                matches!(stream.source(), ByteStreamSource::Child(..))
+                stream.source().is_external()
             } else {
                 false
             };
@@ -877,7 +870,7 @@ fn literal_value(
                 Value::string(path, span)
             } else {
                 let cwd = ctx.engine_state.cwd(Some(ctx.stack))?;
-                let path = expand_path_with(path, cwd, true);
+                let path = ctx.stack.expand_path_with(path, cwd, true);
 
                 Value::string(path.to_string_lossy(), span)
             }
@@ -897,7 +890,7 @@ fn literal_value(
                     .cwd(Some(ctx.stack))
                     .map(AbsolutePathBuf::into_std_path_buf)
                     .unwrap_or_default();
-                let path = expand_path_with(path, cwd, true);
+                let path = ctx.stack.expand_path_with(path, cwd, true);
 
                 Value::string(path.to_string_lossy(), span)
             }
@@ -956,7 +949,7 @@ fn binary_op(
         },
         Operator::Math(mat) => match mat {
             Math::Plus => lhs_val.add(op_span, &rhs_val, span)?,
-            Math::Append => lhs_val.append(op_span, &rhs_val, span)?,
+            Math::Concat => lhs_val.concat(op_span, &rhs_val, span)?,
             Math::Minus => lhs_val.sub(op_span, &rhs_val, span)?,
             Math::Multiply => lhs_val.mul(op_span, &rhs_val, span)?,
             Math::Divide => lhs_val.div(op_span, &rhs_val, span)?,
@@ -1412,7 +1405,8 @@ enum RedirectionStream {
 /// Open a file for redirection
 fn open_file(ctx: &EvalContext<'_>, path: &Value, append: bool) -> Result<Arc<File>, ShellError> {
     let path_expanded =
-        expand_path_with(path.as_str()?, ctx.engine_state.cwd(Some(ctx.stack))?, true);
+        ctx.stack
+            .expand_path_with(path.as_str()?, ctx.engine_state.cwd(Some(ctx.stack))?, true);
     let mut options = File::options();
     if append {
         options.append(true);
@@ -1491,27 +1485,4 @@ fn eval_iterate(
         );
         eval_iterate(ctx, dst, stream, end_index)
     }
-}
-
-/// Redirect environment from the callee stack to the caller stack
-fn redirect_env(engine_state: &EngineState, caller_stack: &mut Stack, callee_stack: &Stack) {
-    // TODO: make this more efficient
-    // Grab all environment variables from the callee
-    let caller_env_vars = caller_stack.get_env_var_names(engine_state);
-
-    // remove env vars that are present in the caller but not in the callee
-    // (the callee hid them)
-    for var in caller_env_vars.iter() {
-        if !callee_stack.has_env_var(engine_state, var) {
-            caller_stack.remove_env_var(engine_state, var);
-        }
-    }
-
-    // add new env vars from callee to caller
-    for (var, value) in callee_stack.get_stack_env_vars() {
-        caller_stack.add_env_var(var, value);
-    }
-
-    // set config to callee config, to capture any updates to that
-    caller_stack.config.clone_from(&callee_stack.config);
 }

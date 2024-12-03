@@ -14,7 +14,7 @@ use nu_table::{
     common::create_nu_table_config, CollapsedTable, ExpandedTable, JustTable, NuTable, NuTableCell,
     StringResult, TableOpts, TableOutput,
 };
-use nu_utils::get_ls_colors;
+use nu_utils::{get_ls_colors, terminal_size};
 use std::{
     collections::VecDeque,
     io::{IsTerminal, Read},
@@ -22,7 +22,6 @@ use std::{
     str::FromStr,
     time::Instant,
 };
-use terminal_size::{Height, Width};
 use url::Url;
 
 const STREAM_PAGE_SIZE: usize = 1000;
@@ -30,7 +29,7 @@ const STREAM_PAGE_SIZE: usize = 1000;
 fn get_width_param(width_param: Option<i64>) -> usize {
     if let Some(col) = width_param {
         col as usize
-    } else if let Some((Width(w), Height(_))) = terminal_size::terminal_size() {
+    } else if let Ok((w, _h)) = terminal_size() {
         w as usize
     } else {
         80
@@ -712,6 +711,13 @@ fn make_clickable_link(
 ) -> String {
     // uri's based on this https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda
 
+    #[cfg(any(
+        unix,
+        windows,
+        target_os = "redox",
+        target_os = "wasi",
+        target_os = "hermit"
+    ))]
     if show_clickable_links {
         format!(
             "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\",
@@ -726,6 +732,18 @@ fn make_clickable_link(
             Some(link_name) => link_name.to_string(),
             None => full_path,
         }
+    }
+
+    #[cfg(not(any(
+        unix,
+        windows,
+        target_os = "redox",
+        target_os = "wasi",
+        target_os = "hermit"
+    )))]
+    match link_name {
+        Some(link_name) => link_name.to_string(),
+        None => full_path,
     }
 }
 
@@ -1088,7 +1106,7 @@ fn create_empty_placeholder(
     let data = vec![vec![cell]];
     let mut table = NuTable::from(data);
     table.set_data_style(TextStyle::default().dimmed());
-    let out = TableOutput::new(table, false, false, false);
+    let out = TableOutput::new(table, false, false, 1);
 
     let style_computer = &StyleComputer::from_config(engine_state, stack);
     let config = create_nu_table_config(&config, style_computer, &out, false, TableMode::default());
